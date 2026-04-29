@@ -132,22 +132,16 @@ class XDP64Assembler:
 
             tokens = re.split(r'\s+', line, maxsplit=1)
 
-            if tokens[0].endswith(','):
-                lbl = tokens[0][:-1]
+            # Robust label matching to safely strip labels without breaking raw data
+            label_match = re.match(r'^([A-Za-z_.][A-Za-z0-9_.$]*),$', tokens[0])
+            if label_match:
+                lbl = label_match.group(1)
                 self.labels[lbl] = self.current_address
                 if len(tokens) == 1:
                     continue
-
-                next_word = tokens[1].split()[0].upper()
-                m_chk = next_word
-                if '.' in m_chk:
-                    parts = m_chk.split('.')
-                    if len(parts) == 2 and parts[1] in ['W', 'H', 'F', 'B']:
-                        m_chk = parts[0]
-
-                if m_chk in self.opcodes or m_chk in self.special_ops or m_chk in self.res_ops or m_chk in ['RES', 'ALIGN', 'IWORD']:
-                    line = tokens[1]
-                    tokens = re.split(r'\s+', line, maxsplit=1)
+                line = tokens[1].strip()
+                if not line: continue
+                tokens = re.split(r'\s+', line, maxsplit=1)
 
             clean_lines.append((self.current_address, line))
             mnemonic = tokens[0].upper()
@@ -181,30 +175,30 @@ class XDP64Assembler:
                 self.current_address += count * multiplier
                 continue
 
-            if ',' in line and m_base not in self.opcodes and m_base not in self.special_ops and m_base != 'RES' and m_base not in self.res_ops:
-                parts = line.split(',', 1)
-                if len(parts) > 1:
-                    raw_val = parts[1].strip()
-                    for part in re.split(r',\s*(?=(?:[^"]*"[^"]*")*[^"]*$)', raw_val):
-                        part = part.strip()
-                        if not part: continue
-                        if '"' in part:
-                            match = re.search(r'([whfbWHFB]?)"(.*)"', part)
-                            if match:
-                                prefix = match.group(1).lower()
-                                s_content = match.group(2).replace('\\n', '\n').replace('\\r', '\r').replace('\\t', '\t').replace('\\0', '\x00')
-                                word_size = 1
-                                if prefix == 'w': word_size = 8
-                                elif prefix == 'h': word_size = 4
-                                elif prefix == 'f': word_size = 2
-                                self.current_address += len(s_content) * word_size
-                        else:
-                            pfx = part[0].lower() if part and part[0].lower() in 'whfb' else 'w'
-                            if pfx == 'b': self.current_address += 1
-                            elif pfx == 'f': self.current_address += 2
-                            elif pfx == 'h': self.current_address += 4
-                            else: self.current_address += 8
-                    continue
+            # Fallback: If not recognized as an opcode, process entire line as a data array
+            if m_base not in self.opcodes and m_base not in self.special_ops:
+                raw_val = line
+                for part in re.split(r',\s*(?=(?:[^"]*"[^"]*")*[^"]*$)', raw_val):
+                    part = part.strip()
+                    if not part: continue
+                    if '"' in part:
+                        match = re.search(r'([whfbWHFB]?)"(.*)"', part)
+                        if match:
+                            prefix = match.group(1).lower()
+                            s_content = match.group(2).replace('\\n', '\n').replace('\\r', '\r').replace('\\t', '\t').replace('\\0', '\x00')
+                            word_size = 1
+                            if prefix == 'w': word_size = 8
+                            elif prefix == 'h': word_size = 4
+                            elif prefix == 'f': word_size = 2
+                            self.current_address += len(s_content) * word_size
+                    else:
+                        pfx = part[0].lower() if part and part[0].lower() in 'whfb' else 'w'
+                        if pfx == 'b': self.current_address += 1
+                        elif pfx == 'f': self.current_address += 2
+                        elif pfx == 'h': self.current_address += 4
+                        else: self.current_address += 8
+                continue
+
             self.current_address += 8
 
         # PASS 2: Generation
@@ -245,7 +239,6 @@ class XDP64Assembler:
                 try: target_addr = int(addr_str, 0)
                 except ValueError: target_addr = self.get_label(addr_str, addr)
 
-                # Format: [X1:8][X2:8][Res:8][Addr:40]
                 iw = (r1 << 56) | (r2 << 48) | (target_addr & 0xFFFFFFFFFF)
                 binary_output.extend(struct.pack('<Q', iw))
                 if verbose: print(f"  {addr:04X}: {mnemonic} {args} -> {iw:016X}")
@@ -264,9 +257,9 @@ class XDP64Assembler:
                 if verbose: print(f"  {addr:04X}: {mnemonic} {args} -> [{count * multiplier} bytes reserved]")
                 continue
 
-            if ',' in line and m_base not in self.opcodes and m_base not in self.special_ops and m_base != 'RES' and m_base != 'ALIGN' and m_base != 'IWORD':
-                parts = line.split(',', 1)
-                raw_val = parts[1].strip()
+            # Fallback: Process pure data directly!
+            if m_base not in self.opcodes and m_base not in self.special_ops:
+                raw_val = line
                 for part in re.split(r',\s*(?=(?:[^"]*"[^"]*")*[^"]*$)', raw_val):
                     part = part.strip()
                     if not part: continue
@@ -459,7 +452,7 @@ class XDP64Assembler:
                     binary_output.extend(struct.pack('<Q', instr))
                     if verbose: print(f"  {addr:04X}: {mnemonic} -> {instr:016X}")
 
-                elif m_base in ['PRINTS', 'INPUT', 'TSTAT']: # TSTAT IS FINALLY BACK HERE!
+                elif m_base in ['PRINTS', 'INPUT', 'TSTAT']:
                     term_str = arg_list[0] if arg_list and arg_list[0] else "0"
                     i_sel = 0
                     if term_str.upper().startswith('A'):
