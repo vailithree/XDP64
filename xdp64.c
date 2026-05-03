@@ -20,7 +20,7 @@
 
 // --- Spec Alignment: PC is 40-bits. ST is the High 24 bits of the 64-bit word! ---
 #define ST_MASK     0xFFFFFF0000000000ULL
-#define SYS_MASK    0xFFFFFFFF00000000ULL // High 32 bits (preserved on Direct Jumps)
+#define SYS_MASK    0xFFFFFFFF00000000ULL 
 
 #define OVF_BIT     (1ULL << 40) // ST[0]
 #define OS1_BIT     (1ULL << 41) // ST[1]
@@ -43,6 +43,19 @@
 #define SWAP32(x) ((((x) & 0xff000000u) >> 24) | (((x) & 0x00ff0000u) >> 8) | (((x) & 0x0000ff00u) << 8) | (((x) & 0x000000ffu) << 24))
 #define SWAP64(x) ((((x) & 0xff00000000000000ull) >> 56) | (((x) & 0x00ff000000000000ull) >> 40) | (((x) & 0x0000ff0000000000ull) >> 24) | (((x) & 0x000000ff00000000ull) >> 8) | (((x) & 0x00000000ff000000ull) << 8) | (((x) & 0x0000000000ff0000ull) << 24) | (((x) & 0x000000000000ff00ull) << 40) | (((x) & 0x00000000000000ffull) << 56))
 
+// --- TLB Cache Structure ---
+#define TLB_SIZE 256
+typedef struct {
+    uint64_t vpage;
+    uint64_t ppage;
+    uint8_t valid;
+    uint8_t is_indirect;
+    uint8_t read_allow;
+    uint8_t write_allow;
+    uint8_t exec_allow;
+    uint8_t is_kernel;
+} TLBEntry;
+
 typedef struct {
     uint64_t A[2048];
     uint64_t PC;
@@ -59,11 +72,12 @@ typedef struct {
     uint8_t  CRB;
     uint8_t  estck; // Enforced Stack Register
 
-    // MMU Registers
+    // MMU Registers & Cache
     uint64_t UBT;
     uint64_t KBT;
     uint64_t UKS;
     uint32_t CURAPP;
+    TLBEntry tlb[TLB_SIZE];
 
     // Graphics State
     uint64_t vbase[16];
@@ -135,7 +149,7 @@ void trigger_exception(XDP64 *cpu, int exception_num) {
     uint64_t addr = (cpu->ETB + (exception_num * 8)) & ADDR_MASK;
     if (addr >= MEMORY_SIZE) { cpu->halted = 1; return; }
 
-    uint64_t target = mem_read(cpu, addr, 0, 1, 0);
+    uint64_t target = mem_read(cpu, addr, 0, 1, 0); 
     DO_JMP(target, 1);
 }
 
@@ -146,7 +160,7 @@ uint64_t mem_read_phys(XDP64 *cpu, uint64_t addr, uint8_t w) {
         uint64_t reg_idx = addr >> 3;
         if (reg_idx == 0 || reg_idx == (uint64_t)(cpu->CRB << 8)) return 0;
         uint64_t val = cpu->A[reg_idx];
-        uint8_t shift = (addr & 7) * 8;
+        uint8_t shift = (addr & 7) * 8; 
         val >>= shift;
         if (w == 0) return val;
         if (w == 1) return (uint32_t)val;
@@ -168,7 +182,7 @@ void mem_write_phys(XDP64 *cpu, uint64_t addr, uint64_t val, uint8_t w) {
     if (addr < 16384) {
         uint64_t reg_idx = addr >> 3;
         if (reg_idx == 0 || reg_idx == (uint64_t)(cpu->CRB << 8)) return;
-        uint8_t shift = (addr & 7) * 8;
+        uint8_t shift = (addr & 7) * 8; 
         if (w == 0) cpu->A[reg_idx] = val;
         else if (w == 1) cpu->A[reg_idx] = (cpu->A[reg_idx] & ~(0xFFFFFFFFULL << shift)) | ((val & 0xFFFFFFFFULL) << shift);
         else if (w == 2) cpu->A[reg_idx] = (cpu->A[reg_idx] & ~(0xFFFFULL << shift)) | ((val & 0xFFFFULL) << shift);
@@ -184,48 +198,72 @@ void mem_write_phys(XDP64 *cpu, uint64_t addr, uint64_t val, uint8_t w) {
     }
 }
 
-// --- MMU Translation Interface ---
+// --- MMU Translation Interface with TLB ---
 int check_pte(XDP64 *cpu, uint64_t pte, int access_type) {
     if (!(pte & PTE_PRESENT)) return 0;
     int is_user = !(cpu->PC & PRIV_BIT);
-    if (is_user && (pte & PTE_KERNEL)) return 0;
-    if (access_type == 0 && !(pte & PTE_READ)) return 0;
-    if (access_type == 1 && !(pte & PTE_WRITE)) return 0;
-    if (access_type == 2 && !(pte & PTE_EXEC)) return 0;
+    if (is_user && (pte & PTE_KERNEL)) return 0; 
+    if (access_type == 0 && !(pte & PTE_READ)) return 0;  
+    if (access_type == 1 && !(pte & PTE_WRITE)) return 0; 
+    if (access_type == 2 && !(pte & PTE_EXEC)) return 0;  
     return 1;
 }
 
 uint64_t translate_address(XDP64 *cpu, uint64_t ea, int is_indirect, int access_type) {
     if (!(cpu->PC & MMU_BIT)) return (ea + (is_indirect ? 0 : cpu->BASE)) & ADDR_MASK;
 
-    uint64_t offset = ea & 0xFFFFF;
+    uint64_t offset = ea & 0xFFFFF; 
+    uint64_t vpage = ea & ~0xFFFFFULL;
+    int is_user = !(cpu->PC & PRIV_BIT);
+
+    // Ultra-Fast L1 TLB Lookup
+    uint64_t hash = ((ea >> 20) ^ (is_indirect ? 0x5555 : 0)) % TLB_SIZE;
+    TLBEntry *t = &cpu->tlb[hash];
+    
+    if (t->valid && t->vpage == vpage && t->is_indirect == is_indirect) {
+        if (is_user && t->is_kernel) return 0xFFFFFFFFFFFFFFFFULL;
+        if (access_type == 0 && !t->read_allow) return 0xFFFFFFFFFFFFFFFFULL;
+        if (access_type == 1 && !t->write_allow) return 0xFFFFFFFFFFFFFFFFULL;
+        if (access_type == 2 && !t->exec_allow) return 0xFFFFFFFFFFFFFFFFULL;
+        return t->ppage + offset;
+    }
+
+    // TLB Miss: Perform standard page walk
     uint64_t group_idx = is_indirect ? ((ea >> 30) & 0x3FF) : ((ea >> 26) & 0x3F);
     uint64_t seg_idx = is_indirect ? ((ea >> 20) & 0x3FF) : ((ea >> 20) & 0x3F);
-    uint64_t group_base, segment_base, segment_entry;
+    uint64_t group_base, segment_entry;
 
     if (ea < cpu->UKS) {
         uint64_t app_entry = mem_read_phys(cpu, (cpu->UBT + cpu->CURAPP * 8) & ADDR_MASK, 0);
         if (!check_pte(cpu, app_entry, access_type)) return 0xFFFFFFFFFFFFFFFFULL;
-
+        
         uint64_t group_entry = mem_read_phys(cpu, ((app_entry & ADDR_MASK) + group_idx * 8) & ADDR_MASK, 0);
         if (!check_pte(cpu, group_entry, access_type)) return 0xFFFFFFFFFFFFFFFFULL;
-
         group_base = group_entry & ADDR_MASK;
     } else {
         uint64_t group_entry = mem_read_phys(cpu, (cpu->KBT + group_idx * 8) & ADDR_MASK, 0);
         if (!check_pte(cpu, group_entry, access_type)) return 0xFFFFFFFFFFFFFFFFULL;
-
         group_base = group_entry & ADDR_MASK;
     }
-
+    
     segment_entry = mem_read_phys(cpu, (group_base + seg_idx * 8) & ADDR_MASK, 0);
     if (!check_pte(cpu, segment_entry, access_type)) return 0xFFFFFFFFFFFFFFFFULL;
+
+    // Save success to the TLB!
+    t->valid = 1;
+    t->vpage = vpage;
+    t->is_indirect = is_indirect;
+    t->ppage = segment_entry & ADDR_MASK;
+    t->is_kernel = (segment_entry & PTE_KERNEL) ? 1 : 0;
+    t->read_allow = (segment_entry & PTE_READ) ? 1 : 0;
+    t->write_allow = (segment_entry & PTE_WRITE) ? 1 : 0;
+    t->exec_allow = (segment_entry & PTE_EXEC) ? 1 : 0;
 
     return (segment_entry & ADDR_MASK) + offset;
 }
 
 uint64_t mem_read(XDP64 *cpu, uint64_t ea, uint8_t w, int is_indirect, int access_type) {
-    if (ea < 16384) return mem_read_phys(cpu, ea, w);
+    if (ea < 16384) return mem_read_phys(cpu, ea, w); 
     uint64_t phys = translate_address(cpu, ea, is_indirect, access_type);
     if (phys == 0xFFFFFFFFFFFFFFFFULL) { trigger_exception(cpu, 1); return 0; }
     return mem_read_phys(cpu, phys, w);
@@ -288,7 +326,7 @@ static double f8_to_f64(uint8_t b) {
 }
 
 static uint8_t f64_to_f8(double d) {
-    if (d != d) return 0x79; // NaN
+    if (d != d) return 0x79; 
     uint8_t sign = (d < 0.0 || (d == 0.0 && 1.0/d < 0.0)) ? 1 : 0;
     if (d < 0) d = -d;
     if (d == INFINITY) return (sign << 7) | 0x78;
@@ -334,56 +372,78 @@ uint64_t pack_float(double d, uint8_t w) {
 uint64_t get_ea(XDP64 *cpu, uint32_t m, uint8_t x, uint8_t r, uint8_t p, uint8_t i, uint8_t w, uint64_t current_pc) {
     uint64_t ea = m;
     uint64_t width = (w == 0) ? 8 : (w == 1) ? 4 : (w == 2) ? 2 : 1;
-
+    
     if (x != 0) {
-        if (p == 1) { ACC(cpu, x) += width; }
+        if (p == 2) { ACC(cpu, x) -= width; } // Pre-decrement
         ea = (ea + (uint32_t)(ACC(cpu, x) & 0xFFFFFFFF)) & 0xFFFFFFFF;
-        if (p == 2) { ACC(cpu, x) -= width; }
+        if (p == 1) { ACC(cpu, x) += width; } // Post-increment
         if (p == 3 && ACC(cpu, x) == 0) cpu->PC += 8;
     }
-
+    
     if (r) {
         ea = (ea + get_pc(cpu)) & ADDR_MASK;
     }
 
     if (i) {
         uint64_t iw = mem_read(cpu, ea & ~7ULL, 0, 0, 0);
-        if (cpu->PC != current_pc) return ea;
+        if (cpu->PC != current_pc) return ea; 
         uint8_t ix1 = (iw >> 56) & 0xFF;
         uint8_t ix2 = (iw >> 48) & 0xFF;
         ea = iw & ADDR_MASK;
         if (ix1) ea = (ea + (uint32_t)(ACC(cpu, ix1) & 0xFFFFFFFF)) & ADDR_MASK;
         if (ix2) ea = (ea + (uint32_t)(ACC(cpu, ix2) & 0xFFFFFFFF)) & ADDR_MASK;
     }
-
+    
     if (w == 0) ea &= ~7ULL;
     else if (w == 1) ea &= ~3ULL;
     else if (w == 2) ea &= ~1ULL;
     return ea;
 }
 
-// --- GPU Network Transfer ---
+// --- GPU Network Transfer (Hardware Accelerated) ---
 void send_vframe(XDP64 *cpu, uint8_t s_id) {
     if (cpu->udp_socket == 0 || cpu->udp_socket == INVALID_SOCKET) return;
-    if (GetTickCount64() - cpu->gpu_last_ping[s_id] > 5000) return;
+    if (GetTickCount64() - cpu->gpu_last_ping[s_id] > 5000) return; 
 
     uint8_t mode = cpu->vmode[s_id];
     if (mode == 0) return;
 
-    uint32_t payload_size = (mode == 1) ? 9600 : 38400;
-    uint32_t packet_size = payload_size + 2;
+    uint32_t total_bytes = 0;
+    if (mode == 1) total_bytes = 9600;
+    else if (mode == 2) total_bytes = 38400;
+    else if (mode == 3) total_bytes = 76800;
+    else if (mode == 4) total_bytes = 153600;
+    else if (mode == 5) total_bytes = 307200;
+    else return;
+
+    uint32_t chunk_size = 38400;
+    uint8_t total_chunks = (total_bytes + chunk_size - 1) / chunk_size;
 
     static uint8_t packet[40000];
-    packet[0] = s_id;
-    packet[1] = mode;
-
     uint64_t base = cpu->vbase[s_id];
-    for (uint32_t i = 0; i < payload_size; i++) {
-        packet[i+2] = mem_read_phys(cpu, (base + i) & ADDR_MASK, 3);
-    }
 
-    sendto(cpu->udp_socket, (const char*)packet, packet_size, 0,
-           (struct sockaddr*)&cpu->gpu_clients[s_id], sizeof(struct sockaddr_in));
+    for (uint8_t chunk = 0; chunk < total_chunks; chunk++) {
+        packet[0] = s_id; packet[1] = mode; packet[2] = chunk; packet[3] = total_chunks;
+
+        uint32_t offset = chunk * chunk_size;
+        uint32_t payload_len = total_bytes - offset;
+        if (payload_len > chunk_size) payload_len = chunk_size;
+
+        uint64_t phys_addr = (base + offset) & ADDR_MASK;
+        
+        // --- MASSIVE SPEED BOOST: DMA Buffer Bypass ---
+        // If the frame sits fully in safe physical RAM, bypass mem_read and dump directly!
+        if (phys_addr >= 16384 && (phys_addr + payload_len) <= MEMORY_SIZE) {
+            memcpy(&packet[4], cpu->memory + phys_addr, payload_len);
+        } else {
+            for (uint32_t i = 0; i < payload_len; i++) {
+                packet[i + 4] = mem_read_phys(cpu, (phys_addr + i) & ADDR_MASK, 3);
+            }
+        }
+
+        sendto(cpu->udp_socket, (const char*)packet, payload_len + 4, 0,
+               (struct sockaddr*)&cpu->gpu_clients[s_id], sizeof(struct sockaddr_in));
+    }
 }
 
 // --- Asynchronous Network Polling ---
@@ -394,7 +454,7 @@ void poll_network(XDP64 *cpu) {
             if (_kbhit()) _getch();
             continue;
         }
-        if (c == 5) {
+        if (c == 5) { 
             cpu->halted = 1;
             printf("\nBreak at %010llX\n", get_pc(cpu));
             continue;
@@ -504,7 +564,7 @@ void handle_io(XDP64 *cpu, uint64_t instr, uint64_t current_pc) {
             uint8_t mode = (data >> 32) & 0x3;
             uint32_t imm = (uint32_t)(data & 0xFFFFFFFF);
             uint64_t prev = 0;
-
+            
             if (sp_reg == 0) prev = cpu->BASE;
             else if (sp_reg == 1) prev = cpu->TTB;
             else if (sp_reg == 2) prev = cpu->ETB;
@@ -544,6 +604,8 @@ void handle_io(XDP64 *cpu, uint64_t instr, uint64_t current_pc) {
             else if (sp_reg == 10) cpu->KBT = n_val & ADDR_MASK;
             else if (sp_reg == 11) cpu->UKS = n_val & ADDR_MASK;
             else if (sp_reg == 12) cpu->CURAPP = (uint32_t)n_val;
+            
+            if (sp_reg >= 9 && sp_reg <= 12) memset(cpu->tlb, 0, sizeof(cpu->tlb)); // Flush TLB safely
 
         } else if (op == 1) { // LFS
             uint8_t sp_reg = (data >> 34) & 0xFF;
@@ -579,22 +641,25 @@ void handle_io(XDP64 *cpu, uint64_t instr, uint64_t current_pc) {
             else if (sp_reg == 10) cpu->KBT = ACC(cpu, a_reg) & ADDR_MASK;
             else if (sp_reg == 11) cpu->UKS = ACC(cpu, a_reg) & ADDR_MASK;
             else if (sp_reg == 12) cpu->CURAPP = (uint32_t)ACC(cpu, a_reg);
+            
+            if (sp_reg >= 9 && sp_reg <= 12) memset(cpu->tlb, 0, sizeof(cpu->tlb)); // Flush TLB safely
 
         } else if (op == 3) { // ERET
             cpu->PC = cpu->ERS;
             cpu->in_exception = 0;
-
+            
         } else if (op == 4) { // EFLSH
             cpu->ERS = 0;
-
+            
         } else if (op == 5) { // ESTCK
             cpu->estck = (data >> 34) & 0xFF;
         }
-
+        
     } else if (dev == 0x01) { // MMU
         uint8_t op = (data >> 42) & 0xFF;
         if (op == 0) cpu->PC |= MMU_BIT;
         else if (op == 1) cpu->PC &= ~MMU_BIT;
+        else if (op == 2) memset(cpu->tlb, 0, sizeof(cpu->tlb)); // INVPG
 
     } else if (dev == 0x02) { // Teletype/Console
         uint8_t io_op = (data >> 46) & 0xF;
@@ -637,13 +702,13 @@ void handle_io(XDP64 *cpu, uint64_t instr, uint64_t current_pc) {
                 int remaining = cpu->input_len[actual_t] - (line_end + 1);
                 if (remaining > 0) memmove(cpu->input_buffer[actual_t], &cpu->input_buffer[actual_t][line_end + 1], remaining);
                 cpu->input_len[actual_t] = remaining;
-            } else {
-                b[0] = 0; len = 0;
+            } else { 
+                b[0] = 0; len = 0; 
             }
 
-            for (size_t j=0; j<=len; j++) {
-                mem_write(cpu, addr+j, b[j], 3, 1);
-                if (cpu->PC != current_pc) return;
+            for (size_t j=0; j<=len; j++) { 
+                mem_write(cpu, addr+j, b[j], 3, 1); 
+                if (cpu->PC != current_pc) return; 
             }
             ACC(cpu, 255) = (uint64_t)len;
 
@@ -670,14 +735,14 @@ void handle_io(XDP64 *cpu, uint64_t instr, uint64_t current_pc) {
             int has_data = 0, is_connected = 0;
             if (actual_t == 0) {
                 is_connected = 1;
-                for(int j = 0; j < cpu->input_len[actual_t]; j++) {
-                    if (cpu->input_buffer[actual_t][j] == '\n') { has_data = 1; break; }
+                for(int j = 0; j < cpu->input_len[actual_t]; j++) { 
+                    if (cpu->input_buffer[actual_t][j] == '\n') { has_data = 1; break; } 
                 }
             } else {
                 if (cpu->client_sockets[actual_t] != 0 && cpu->client_sockets[actual_t] != INVALID_SOCKET) {
                     is_connected = 1;
-                    for(int j = 0; j < cpu->input_len[actual_t]; j++) {
-                        if (cpu->input_buffer[actual_t][j] == '\n') { has_data = 1; break; }
+                    for(int j = 0; j < cpu->input_len[actual_t]; j++) { 
+                        if (cpu->input_buffer[actual_t][j] == '\n') { has_data = 1; break; } 
                     }
                 }
             }
@@ -698,59 +763,59 @@ void handle_io(XDP64 *cpu, uint64_t instr, uint64_t current_pc) {
             if (w == 1) val = (int64_t)(int32_t)val;
             else if (w == 2) val = (int64_t)(int16_t)val;
             else if (w == 3) val = (int64_t)(int8_t)val;
-
+            
             char buf[64]; sprintf(buf, "%lld", val);
             uint64_t addr = ACC(cpu, dst_reg) & ADDR_MASK;
             size_t len = strlen(buf);
-
-            for (size_t j=0; j<=len; j++) {
-                mem_write(cpu, addr+j, buf[j], 3, 1);
-                if (cpu->PC != current_pc) return;
+            
+            for (size_t j=0; j<=len; j++) { 
+                mem_write(cpu, addr+j, buf[j], 3, 1); 
+                if (cpu->PC != current_pc) return; 
             }
             if(len_dst_reg != 0) ACC(cpu, len_dst_reg) = len;
-
+            
         } else if (io_op == 1) { // ATOI
             uint64_t addr = ACC(cpu, src_reg) & ADDR_MASK;
             char buf[256]; size_t i = 0;
-            while(i < 255) {
-                buf[i] = mem_read(cpu, addr+i, 3, 1, 0);
-                if (cpu->PC != current_pc) return;
-                if (buf[i] == 0) break;
-                i++;
+            while(i < 255) { 
+                buf[i] = mem_read(cpu, addr+i, 3, 1, 0); 
+                if (cpu->PC != current_pc) return; 
+                if (buf[i] == 0) break; 
+                i++; 
             }
             buf[i] = 0;
             int64_t val = (int64_t)strtoll(buf, NULL, 10);
-
+            
             if (w == 1) val = (int64_t)(int32_t)val;
             else if (w == 2) val = (int64_t)(int16_t)val;
             else if (w == 3) val = (int64_t)(int8_t)val;
             if(dst_reg != 0) ACC(cpu, dst_reg) = (uint64_t)val;
-
+            
         } else if (io_op == 2) { // FTOA
             double val = get_float(ACC(cpu, src_reg), w);
             char buf[64]; sprintf(buf, "%g", val);
             uint64_t addr = ACC(cpu, dst_reg) & ADDR_MASK;
             size_t len = strlen(buf);
-
-            for (size_t j=0; j<=len; j++) {
-                mem_write(cpu, addr+j, buf[j], 3, 1);
-                if (cpu->PC != current_pc) return;
+            
+            for (size_t j=0; j<=len; j++) { 
+                mem_write(cpu, addr+j, buf[j], 3, 1); 
+                if (cpu->PC != current_pc) return; 
             }
             if(len_dst_reg != 0) ACC(cpu, len_dst_reg) = len;
-
+            
         } else if (io_op == 3) { // ATOF
             uint64_t addr = ACC(cpu, src_reg) & ADDR_MASK;
             char buf[256]; size_t i = 0;
-            while(i < 255) {
-                buf[i] = mem_read(cpu, addr+i, 3, 1, 0);
-                if (cpu->PC != current_pc) return;
-                if (buf[i] == 0) break;
-                i++;
+            while(i < 255) { 
+                buf[i] = mem_read(cpu, addr+i, 3, 1, 0); 
+                if (cpu->PC != current_pc) return; 
+                if (buf[i] == 0) break; 
+                i++; 
             }
             buf[i] = 0;
             double val = strtod(buf, NULL);
             if(dst_reg != 0) ACC(cpu, dst_reg) = pack_float(val, w);
-
+            
         } else if (io_op == 4) { // SPSP
             uint8_t c_reg = (data >> 8) & 0xFF;
             uint8_t y_flag = (data >> 7) & 0x1;
@@ -758,7 +823,7 @@ void handle_io(XDP64 *cpu, uint64_t instr, uint64_t current_pc) {
 
             uint64_t src_addr = ACC(cpu, src_reg) & ADDR_MASK;
             uint64_t dst_addr = ACC(cpu, dst_reg) & ADDR_MASK;
-            uint64_t current_word = 0;
+            uint64_t current_word = 0; 
             int in_word = 0, char_idx = 0, ext_len = 0;
             char extracted[256] = {0};
 
@@ -766,12 +831,12 @@ void handle_io(XDP64 *cpu, uint64_t instr, uint64_t current_pc) {
                 char c = mem_read(cpu, src_addr + char_idx, 3, 1, 0);
                 if (cpu->PC != current_pc) return;
                 if (c == 0) break;
-
+                
                 if (c == ' ') {
-                    if (in_word) {
-                        in_word = 0;
-                        if (current_word == target_word) break;
-                        current_word++;
+                    if (in_word) { 
+                        in_word = 0; 
+                        if (current_word == target_word) break; 
+                        current_word++; 
                     }
                 } else {
                     if (!in_word) in_word = 1;
@@ -782,12 +847,12 @@ void handle_io(XDP64 *cpu, uint64_t instr, uint64_t current_pc) {
                 char_idx++;
             }
             extracted[ext_len] = '\0';
-            for (int j = 0; j <= ext_len; j++) {
-                mem_write(cpu, dst_addr + j, extracted[j], 3, 1);
-                if (cpu->PC != current_pc) return;
+            for (int j = 0; j <= ext_len; j++) { 
+                mem_write(cpu, dst_addr + j, extracted[j], 3, 1); 
+                if (cpu->PC != current_pc) return; 
             }
         }
-
+        
     } else if (dev == 0x04) { // Tape Drive
         uint8_t io_op = (data >> 42) & 0xFF;
         uint8_t ind = (data >> 41) & 0x1;
@@ -800,34 +865,34 @@ void handle_io(XDP64 *cpu, uint64_t instr, uint64_t current_pc) {
 
         uint32_t tape_addr = (m_addr + (uint32_t)(ACC(cpu, idx) & 0xFFFFF)) & 0xFFFFF;
         char filename[256];
-        if (cpu->tape_files[tape_id][0] != '\0') {
-            strncpy(filename, cpu->tape_files[tape_id], 255);
-            filename[255] = '\0';
+        if (cpu->tape_files[tape_id][0] != '\0') { 
+            strncpy(filename, cpu->tape_files[tape_id], 255); 
+            filename[255] = '\0'; 
         } else {
             sprintf(filename, "tape%d.bin", tape_id);
         }
 
         FILE *f = fopen(filename, "r+b");
-        if (!f) {
-            f = fopen(filename, "w+b");
-            if (f) { fseek(f, 1024*1024 - 1, SEEK_SET); fputc(0, f); }
+        if (!f) { 
+            f = fopen(filename, "w+b"); 
+            if (f) { fseek(f, 1024*1024 - 1, SEEK_SET); fputc(0, f); } 
         }
 
         if (f) {
             fseek(f, tape_addr, SEEK_SET);
             int bytes = (w==0)?8:(w==1)?4:(w==2)?2:1;
-
+            
             if (io_op == 0) { // TWRITE
                 uint64_t w_data = ind ? mem_read(cpu, ACC(cpu, acc) & ADDR_MASK, w, 1, 0) : ACC(cpu, acc);
                 if (cpu->PC != current_pc) { fclose(f); return; }
                 fwrite(&w_data, 1, bytes, f);
             } else if (io_op == 1) { // TREAD
-                uint64_t r_data = 0;
+                uint64_t r_data = 0; 
                 fread(&r_data, 1, bytes, f);
-
-                if (ind) {
-                    mem_write(cpu, ACC(cpu, acc) & ADDR_MASK, r_data, w, 1);
-                    if (cpu->PC != current_pc) { fclose(f); return; }
+                
+                if (ind) { 
+                    mem_write(cpu, ACC(cpu, acc) & ADDR_MASK, r_data, w, 1); 
+                    if (cpu->PC != current_pc) { fclose(f); return; } 
                 } else if (acc != 0) {
                     if (w == 0) ACC(cpu, acc) = r_data;
                     else if (w == 1) ACC(cpu, acc) = (ACC(cpu, acc) & 0xFFFFFFFF00000000ULL) | (r_data & 0xFFFFFFFF);
@@ -837,7 +902,7 @@ void handle_io(XDP64 *cpu, uint64_t instr, uint64_t current_pc) {
             }
             fclose(f);
         }
-
+        
     } else if (dev == 0x05) { // Disk Drive
         uint8_t w = (data >> 48) & 0x3;
         uint8_t d_op = (data >> 44) & 0xF;
@@ -851,9 +916,9 @@ void handle_io(XDP64 *cpu, uint64_t instr, uint64_t current_pc) {
         uint64_t loc = ACC(cpu, l) & 0xFFFFFFFFULL;
 
         char filename[256];
-        if (cpu->disk_files[disk_id][0] != '\0') {
-            strncpy(filename, cpu->disk_files[disk_id], 255);
-            filename[255] = '\0';
+        if (cpu->disk_files[disk_id][0] != '\0') { 
+            strncpy(filename, cpu->disk_files[disk_id], 255); 
+            filename[255] = '\0'; 
         } else {
             sprintf(filename, "disk%d.img", disk_id);
         }
@@ -864,14 +929,14 @@ void handle_io(XDP64 *cpu, uint64_t instr, uint64_t current_pc) {
         if (f) {
             fseek(f, loc, SEEK_SET);
             int bytes = (w==0)?8:(w==1)?4:(w==2)?2:1;
-
+            
             if (d_op == 0) { // READ
-                uint64_t r_data = 0;
+                uint64_t r_data = 0; 
                 fread(&r_data, 1, bytes, f);
-
-                if (ind) {
-                    mem_write(cpu, ACC(cpu, a) & ADDR_MASK, r_data, w, 1);
-                    if (cpu->PC != current_pc) { fclose(f); return; }
+                
+                if (ind) { 
+                    mem_write(cpu, ACC(cpu, a) & ADDR_MASK, r_data, w, 1); 
+                    if (cpu->PC != current_pc) { fclose(f); return; } 
                 } else if (a != 0) {
                     if (w == 0) ACC(cpu, a) = r_data;
                     else if (w == 1) ACC(cpu, a) = (ACC(cpu, a) & 0xFFFFFFFF00000000ULL) | (r_data & 0xFFFFFFFF);
@@ -885,7 +950,25 @@ void handle_io(XDP64 *cpu, uint64_t instr, uint64_t current_pc) {
             }
             fclose(f);
         }
-
+        
+    } else if (dev == 0x06) { // Timer
+        uint8_t t_op = (data >> 46) & 0xF;
+        uint32_t ms_wait = 0;
+        
+        if (t_op == 0) {
+            ms_wait = (uint32_t)(data & 0xFFFFFFFF);
+        } else if (t_op == 1) {
+            uint8_t reg = (data >> 38) & 0xFF;
+            ms_wait = (uint32_t)ACC(cpu, reg);
+        }
+        
+        if (ms_wait > 0) {
+            uint64_t start_tick = GetTickCount64();
+            while ((GetTickCount64() - start_tick) < ms_wait) {
+                poll_network(cpu); // Keep UDP heartbeats alive during WAIT!
+                Sleep(1);
+            }
+        }
     } else if (dev == 0x07) { // Graphics Network VDP
         uint8_t o_op = (data >> 46) & 0xF;
         uint8_t s_id = (data >> 42) & 0xF;
@@ -894,7 +977,7 @@ void handle_io(XDP64 *cpu, uint64_t instr, uint64_t current_pc) {
         uint64_t arg_val = i_flag ? a_reg : ACC(cpu, a_reg);
 
         if (o_op == 0) cpu->vbase[s_id] = arg_val & ADDR_MASK;
-        else if (o_op == 1) cpu->vmode[s_id] = (uint8_t)(arg_val & 0x3);
+        else if (o_op == 1) cpu->vmode[s_id] = (uint8_t)(arg_val & 0x7);
         else if (o_op == 2) send_vframe(cpu, s_id);
         else if (o_op == 3) ACC(cpu, a_reg) = (GetTickCount64() - cpu->gpu_last_ping[s_id] < 5000) ? 1 : 0;
     }
@@ -908,30 +991,49 @@ static inline uint64_t extract_lane(uint64_t vec, uint8_t w, int k) {
     return (vec >> (8 * k)) & 0xFFULL;
 }
 
+// Helper for BRT (Block Rotate) -> Allows totally in-place rotation avoiding mallocs
+static void reverse_elements(XDP64 *cpu, uint64_t addr, uint64_t start, uint64_t end, uint8_t w_b, uint64_t current_pc) {
+    uint64_t bytes = (w_b == 0) ? 8 : (w_b == 1) ? 4 : (w_b == 2) ? 2 : 1;
+    while (start < end) {
+        uint64_t val1 = mem_read(cpu, addr + start * bytes, w_b, 1, 0);
+        if (cpu->PC != current_pc) return;
+        uint64_t val2 = mem_read(cpu, addr + end * bytes, w_b, 1, 0);
+        if (cpu->PC != current_pc) return;
+
+        mem_write(cpu, addr + start * bytes, val2, w_b, 1);
+        if (cpu->PC != current_pc) return;
+        mem_write(cpu, addr + end * bytes, val1, w_b, 1);
+        if (cpu->PC != current_pc) return;
+
+        start++;
+        end--;
+    }
+}
+
 // --- Execution Core ---
 void step(XDP64 *cpu) {
     if (cpu->step_count % 128 == 0) poll_network(cpu);
 
-    ACC(cpu, 0) = 0;
+    ACC(cpu, 0) = 0; 
 
     uint64_t pc_val = get_pc(cpu);
     uint64_t instr;
 
     int is_user = (cpu->PC & MMU_BIT) && (pc_val < cpu->UKS);
     int priv_allowed = !is_user || (cpu->PC & PRIV_BIT);
-    uint64_t current_pc = cpu->PC;
+    uint64_t current_pc = cpu->PC; 
 
     if (cpu->rep_count > 0) {
         instr = cpu->loop_buffer[cpu->rep_idx++];
-        if (cpu->rep_idx >= cpu->rep_len) {
-            cpu->rep_idx = 0;
-            cpu->rep_count--;
+        if (cpu->rep_idx >= cpu->rep_len) { 
+            cpu->rep_idx = 0; 
+            cpu->rep_count--; 
         }
     } else {
         instr = mem_read(cpu, pc_val, 0, 1, 2);
-        if (cpu->PC != current_pc) return;
+        if (cpu->PC != current_pc) return; 
         cpu->PC = (cpu->PC & SYS_MASK) | ((pc_val + 8) & ADDR_MASK);
-        current_pc = cpu->PC;
+        current_pc = cpu->PC; 
     }
 
     cpu->current_instr = instr;
@@ -947,7 +1049,7 @@ void step(XDP64 *cpu) {
     if ((instr >> 58) == 0x3F) {
         uint8_t dev = (instr >> 50) & 0xFF;
         if ((dev == 0 || dev == 1 || dev == 2 || dev == 5 || dev == 6 || dev == 7) && !priv_allowed) {
-            trigger_exception(cpu, 5);
+            trigger_exception(cpu, 5); 
             return;
         }
         handle_io(cpu, instr, current_pc);
@@ -969,29 +1071,29 @@ void step(XDP64 *cpu) {
         else if (op == 65) { // TRAP / TRET
             uint8_t a = (instr >> 46) & 0xFF;
             uint8_t t = (instr >> 45) & 1;
-
+            
             if (t == 0) { // TRAP
                 if ((cpu->PC & MMU_BIT) && cpu->estck != 0 && a != cpu->estck) {
                     a = cpu->estck;
                 }
                 uint8_t imm8 = instr & 0xFF;
-                ACC(cpu, a) -= 8;
+                ACC(cpu, a) -= 8; 
                 if(a == 0) ACC(cpu, 0) = 0;
-
+                
                 mem_write(cpu, ACC(cpu, a) & ADDR_MASK, get_pc(cpu), 0, 1);
                 if (cpu->PC != current_pc) return;
-
+                
                 uint64_t target = mem_read(cpu, (cpu->TTB + (imm8 * 8)) & ADDR_MASK, 0, 1, 0);
                 if (cpu->PC != current_pc) return;
-
+                
                 DO_JMP(target, 1);
             } else { // TRET
                 uint64_t rv = mem_read(cpu, ACC(cpu, a) & ADDR_MASK, 0, 1, 0);
                 if (cpu->PC != current_pc) return;
-
-                ACC(cpu, a) += 8;
+                
+                ACC(cpu, a) += 8; 
                 if(a == 0) ACC(cpu, 0) = 0;
-
+                
                 DO_JMP(rv, 1);
             }
         }
@@ -1009,17 +1111,17 @@ void step(XDP64 *cpu) {
             uint8_t a_reg = (instr >> 37) & 0xFF, f_flag = (instr >> 36) & 1;
             uint64_t count = i_flag ? r : ACC(cpu, r);
             uint64_t len = f_flag ? a_reg : ACC(cpu, a_reg);
-
+            
             if (len > 32) len = 32;
-
+            
             if (len > 0 && count > 0) {
                 for (uint32_t k = 0; k < len; k++) {
                     cpu->loop_buffer[k] = mem_read(cpu, get_pc(cpu) + k*8, 0, 1, 2);
-                    if (cpu->PC != current_pc) return;
+                    if (cpu->PC != current_pc) return; 
                 }
                 cpu->PC = (cpu->PC & SYS_MASK) | ((get_pc(cpu) + len*8) & ADDR_MASK);
-                cpu->rep_count = count;
-                cpu->rep_len = len;
+                cpu->rep_count = count; 
+                cpu->rep_len = len; 
                 cpu->rep_idx = 0;
             } else if (len > 0) {
                 cpu->PC = (cpu->PC & SYS_MASK) | ((get_pc(cpu) + len*8) & ADDR_MASK);
@@ -1030,13 +1132,13 @@ void step(XDP64 *cpu) {
             uint8_t b_reg = (instr >> 36) & 0xFF, c_reg = (instr >> 28) & 0xFF, i_flag = (instr >> 27) & 1;
             uint64_t count = i_flag ? c_reg : ACC(cpu, c_reg);
             uint64_t bytes = (w_b == 0) ? 8 : (w_b == 1) ? 4 : (w_b == 2) ? 2 : 1;
-
+            
             for (uint64_t k = 0; k < count; k++) {
                 uint64_t src_addr = ACC(cpu, a_reg) + k*bytes;
                 uint64_t dst_addr = ACC(cpu, b_reg) + k*bytes;
                 uint64_t v = mem_read(cpu, src_addr, w_b, 1, 0);
                 if (cpu->PC != current_pc) return;
-
+                
                 mem_write(cpu, dst_addr, v, w_b, 1);
                 if (cpu->PC != current_pc) return;
             }
@@ -1045,7 +1147,7 @@ void step(XDP64 *cpu) {
             uint8_t a_val = (instr >> 46) & 0xFF, b_reg = (instr >> 38) & 0xFF;
             uint8_t c_reg = (instr >> 30) & 0xFF, i_flag = (instr >> 29) & 1;
             uint64_t count = i_flag ? c_reg : ACC(cpu, c_reg);
-
+            
             for (uint64_t k = 0; k < count; k++) {
                 uint64_t dst_addr = ACC(cpu, b_reg) + k;
                 mem_write(cpu, dst_addr, a_val, 3, 1);
@@ -1058,7 +1160,7 @@ void step(XDP64 *cpu) {
             uint64_t count = i_flag ? c_reg : ACC(cpu, c_reg);
             uint64_t bytes = (w_b == 0) ? 8 : (w_b == 1) ? 4 : (w_b == 2) ? 2 : 1;
             uint64_t val = ACC(cpu, a_reg);
-
+            
             for (uint64_t k = 0; k < count; k++) {
                 uint64_t dst_addr = ACC(cpu, b_reg) + k*bytes;
                 mem_write(cpu, dst_addr, val, w_b, 1);
@@ -1069,40 +1171,40 @@ void step(XDP64 *cpu) {
             uint8_t op3 = (instr >> 49) & 0x1F, w_b = (instr >> 47) & 0x3;
             uint8_t a = (instr >> 39) & 0xFF, b = (instr >> 31) & 0xFF;
             uint8_t c = (instr >> 23) & 0xFF, d = (instr >> 15) & 0xFF;
-
+            
             uint64_t va = ACC(cpu, a);
             uint64_t vb = ACC(cpu, b);
-
+            
             if (op3 == 0) { // TADD
-                ACC(cpu, c) = va + vb;
+                ACC(cpu, c) = va + vb; 
             } else if (op3 == 1) { // TSUB
-                ACC(cpu, c) = va - vb;
+                ACC(cpu, c) = va - vb; 
             } else if (op3 == 2) { // TMUL
-                ACC(cpu, c) = va * vb;
+                ACC(cpu, c) = va * vb; 
             } else if (op3 == 3) { // TDIV
                 if (vb == 0) { trigger_exception(cpu, 0); return; }
-                ACC(cpu, c) = va / vb;
+                ACC(cpu, c) = va / vb; 
                 ACC(cpu, d) = va % vb;
             } else if (op3 == 4) { // TFAD
-                ACC(cpu, c) = pack_float(get_float(va, w_b) + get_float(vb, w_b), w_b);
+                ACC(cpu, c) = pack_float(get_float(va, w_b) + get_float(vb, w_b), w_b); 
             } else if (op3 == 5) { // TFSB
-                ACC(cpu, c) = pack_float(get_float(va, w_b) - get_float(vb, w_b), w_b);
+                ACC(cpu, c) = pack_float(get_float(va, w_b) - get_float(vb, w_b), w_b); 
             } else if (op3 == 6) { // TFML
-                ACC(cpu, c) = pack_float(get_float(va, w_b) * get_float(vb, w_b), w_b);
+                ACC(cpu, c) = pack_float(get_float(va, w_b) * get_float(vb, w_b), w_b); 
             } else if (op3 == 7) { // TFDV
                 double fb = get_float(vb, w_b);
                 if (fb == 0.0) { trigger_exception(cpu, 0); return; }
                 ACC(cpu, c) = pack_float(get_float(va, w_b) / fb, w_b);
             } else if (op3 == 8) { // TXP
                 uint64_t base = va, exp = vb, res = 1;
-                while (exp > 0) {
-                    if (exp % 2 == 1) res *= base;
-                    base *= base;
-                    exp /= 2;
+                while (exp > 0) { 
+                    if (exp % 2 == 1) res *= base; 
+                    base *= base; 
+                    exp /= 2; 
                 }
                 ACC(cpu, c) = res;
             } else if (op3 == 9) { // TFXP
-                ACC(cpu, c) = pack_float(pow(get_float(va, w_b), get_float(vb, w_b)), w_b);
+                ACC(cpu, c) = pack_float(pow(get_float(va, w_b), get_float(vb, w_b)), w_b); 
             }
         }
         else if (op == 96) { // SIMD
@@ -1111,16 +1213,16 @@ void step(XDP64 *cpu) {
             uint8_t a = (instr >> 38) & 0xFF;
             uint8_t b = (instr >> 30) & 0xFF;
             uint8_t c = (instr >> 22) & 0xFF;
-
+            
             uint8_t iii = (instr >> 19) & 0x7;
             int ia = (iii >> 2) & 1;
             int ib = (iii >> 1) & 1;
             int ic = iii & 1;
-
+            
             uint64_t va = ia ? mem_read(cpu, ACC(cpu, a) & ~7ULL, 0, 1, 0) : ACC(cpu, a);
             uint64_t vb = ib ? mem_read(cpu, ACC(cpu, b) & ~7ULL, 0, 1, 0) : ACC(cpu, b);
             if (cpu->PC != current_pc) return;
-
+            
             uint64_t vc = 0;
             int lanes = (w_b == 0) ? 1 : (w_b == 1) ? 2 : (w_b == 2) ? 4 : 8;
             uint64_t mask = (w_b == 0) ? 0xFFFFFFFFFFFFFFFFULL : (w_b == 1) ? 0xFFFFFFFFULL : (w_b == 2) ? 0xFFFFULL : 0xFFULL;
@@ -1133,27 +1235,27 @@ void step(XDP64 *cpu) {
             } else {
                 double fsum = 0.0;
                 int64_t isum = 0;
-
+                
                 for (int k = 0; k < lanes; k++) {
                     int shift = ((w_b == 0) ? 0 : (w_b == 1) ? 32 : (w_b == 2) ? 16 : 8) * k;
                     uint64_t la = (va >> shift) & mask;
                     uint64_t lb = (vb >> shift) & mask;
                     uint64_t lc = 0;
-
+                    
                     if (sop == 0) { // VFAD
-                        lc = pack_float(get_float(la, w_b) + get_float(lb, w_b), w_b);
+                        lc = pack_float(get_float(la, w_b) + get_float(lb, w_b), w_b); 
                     } else if (sop == 1) { // VFSB
-                        lc = pack_float(get_float(la, w_b) - get_float(lb, w_b), w_b);
+                        lc = pack_float(get_float(la, w_b) - get_float(lb, w_b), w_b); 
                     } else if (sop == 2) { // VFML
-                        lc = pack_float(get_float(la, w_b) * get_float(lb, w_b), w_b);
+                        lc = pack_float(get_float(la, w_b) * get_float(lb, w_b), w_b); 
                     } else if (sop == 3) { // VFDV
                         double flb = get_float(lb, w_b);
                         if (flb == 0.0) { trigger_exception(cpu, 0); return; }
                         lc = pack_float(get_float(la, w_b) / flb, w_b);
                     } else if (sop == 4) { // VADD
-                        lc = la + lb;
+                        lc = la + lb; 
                     } else if (sop == 5) { // VSUB
-                        lc = la - lb;
+                        lc = la - lb; 
                     } else if (sop == 6) { // VDOT
                         int64_t sla = la, slb = lb;
                         if (w_b == 1) { sla = (int32_t)la; slb = (int32_t)lb; }
@@ -1161,43 +1263,43 @@ void step(XDP64 *cpu) {
                         else if (w_b == 3) { sla = (int8_t)la; slb = (int8_t)lb; }
                         isum += sla * slb;
                     } else if (sop == 7) { // VFDOT
-                        fsum += get_float(la, w_b) * get_float(lb, w_b);
+                        fsum += get_float(la, w_b) * get_float(lb, w_b); 
                     } else if (sop == 8 || sop == 9) { // VLRP, VFLRP
-                        double t = get_float(ACC(cpu, 255), w_b);
+                        double t = get_float(ACC(cpu, 255), w_b); 
                         if (sop == 8) lc = (uint64_t)((double)la + ((double)lb - (double)la) * t);
                         else lc = pack_float(get_float(la, w_b) + (get_float(lb, w_b) - get_float(la, w_b)) * t, w_b);
                     } else if (sop == 10) { // VFMAX
-                        lc = pack_float(fmax(get_float(la, w_b), get_float(lb, w_b)), w_b);
+                        lc = pack_float(fmax(get_float(la, w_b), get_float(lb, w_b)), w_b); 
                     } else if (sop == 11) { // VMAX
                         int64_t sla = la, slb = lb;
-                        if (w_b == 1) { sla = (int32_t)la; slb = (int32_t)lb; }
-                        else if (w_b == 2) { sla = (int16_t)la; slb = (int16_t)lb; }
+                        if (w_b == 1) { sla = (int32_t)la; slb = (int32_t)lb; } 
+                        else if (w_b == 2) { sla = (int16_t)la; slb = (int16_t)lb; } 
                         else if (w_b == 3) { sla = (int8_t)la; slb = (int8_t)lb; }
                         lc = (sla > slb) ? la : lb;
                     } else if (sop == 12) { // VFMIN
-                        lc = pack_float(fmin(get_float(la, w_b), get_float(lb, w_b)), w_b);
+                        lc = pack_float(fmin(get_float(la, w_b), get_float(lb, w_b)), w_b); 
                     } else if (sop == 13) { // VMIN
                         int64_t sla = la, slb = lb;
-                        if (w_b == 1) { sla = (int32_t)la; slb = (int32_t)lb; }
-                        else if (w_b == 2) { sla = (int16_t)la; slb = (int16_t)lb; }
+                        if (w_b == 1) { sla = (int32_t)la; slb = (int32_t)lb; } 
+                        else if (w_b == 2) { sla = (int16_t)la; slb = (int16_t)lb; } 
                         else if (w_b == 3) { sla = (int8_t)la; slb = (int8_t)lb; }
                         lc = (sla < slb) ? la : lb;
                     } else if (sop == 18) { // VCEQ
-                        lc = (la == lb) ? mask : 0;
+                        lc = (la == lb) ? mask : 0; 
                     } else if (sop == 19) { // VCGT
                         int64_t sla = la, slb = lb;
-                        if (w_b == 1) { sla = (int32_t)la; slb = (int32_t)lb; }
-                        else if (w_b == 2) { sla = (int16_t)la; slb = (int16_t)lb; }
+                        if (w_b == 1) { sla = (int32_t)la; slb = (int32_t)lb; } 
+                        else if (w_b == 2) { sla = (int16_t)la; slb = (int16_t)lb; } 
                         else if (w_b == 3) { sla = (int8_t)la; slb = (int8_t)lb; }
                         lc = (sla > slb) ? mask : 0;
                     } else if (sop == 20) { // VCLT
                         int64_t sla = la, slb = lb;
-                        if (w_b == 1) { sla = (int32_t)la; slb = (int32_t)lb; }
-                        else if (w_b == 2) { sla = (int16_t)la; slb = (int16_t)lb; }
+                        if (w_b == 1) { sla = (int32_t)la; slb = (int32_t)lb; } 
+                        else if (w_b == 2) { sla = (int16_t)la; slb = (int16_t)lb; } 
                         else if (w_b == 3) { sla = (int8_t)la; slb = (int8_t)lb; }
                         lc = (sla < slb) ? mask : 0;
                     } else if (sop == 21) { // VBRD
-                        lc = va & mask;
+                        lc = va & mask; 
                     } else if (sop == 22) { // VSHF
                         int idx = lb % lanes;
                         int s2 = ((w_b == 0) ? 0 : (w_b == 1) ? 32 : (w_b == 2) ? 16 : 8) * idx;
@@ -1205,11 +1307,11 @@ void step(XDP64 *cpu) {
                     }
 
                     if (sop == 6) { // Accum VDOT
-                        vc = isum;
+                        vc = isum; 
                     } else if (sop == 7) { // Accum VFDOT
-                        vc = pack_float(fsum, w_b);
+                        vc = pack_float(fsum, w_b); 
                     } else if (sop != 23) { // Pack standard result
-                        vc |= (lc & mask) << shift;
+                        vc |= (lc & mask) << shift; 
                     }
                 }
 
@@ -1218,7 +1320,7 @@ void step(XDP64 *cpu) {
                     int in_shift = (w_b == 0) ? 0 : (w_b == 1) ? 32 : (w_b == 2) ? 16 : 8;
                     int out_shift = (out_w == 1) ? 32 : (out_w == 2) ? 16 : 8;
                     uint64_t out_mask = (out_w == 1) ? 0xFFFFFFFFULL : (out_w == 2) ? 0xFFFFULL : 0xFFULL;
-
+                    
                     for(int k = 0; k < lanes; k++) {
                         uint64_t la = (va >> (k * in_shift)) & mask;
                         uint64_t lb = (vb >> (k * in_shift)) & mask;
@@ -1227,11 +1329,138 @@ void step(XDP64 *cpu) {
                     }
                 }
             }
-
+            
             if (ic) {
                 mem_write(cpu, ACC(cpu, c) & ~7ULL, vc, 0, 1);
             } else {
                 ACC(cpu, c) = vc;
+            }
+        }
+        else if (op == 97) { // BRT
+            uint8_t w_b = (instr >> 52) & 0x3;
+            uint8_t d = (instr >> 51) & 1;
+            uint8_t a_reg = (instr >> 43) & 0xFF;
+            uint8_t b_val = (instr >> 35) & 0xFF;
+            uint8_t i_flag = (instr >> 34) & 1;
+            uint8_t c_val = (instr >> 26) & 0xFF;
+            uint8_t o_flag = (instr >> 25) & 1;
+
+            uint64_t addr = ACC(cpu, a_reg);
+            uint64_t len = i_flag ? b_val : ACC(cpu, b_val);
+            uint64_t rot = o_flag ? ACC(cpu, c_val) : c_val;
+
+            if (len > 0) {
+                rot %= len;
+                if (rot > 0) {
+                    if (d == 0) { // BRTL
+                        reverse_elements(cpu, addr, 0, rot - 1, w_b, current_pc);
+                        if (cpu->PC != current_pc) return;
+                        reverse_elements(cpu, addr, rot, len - 1, w_b, current_pc);
+                        if (cpu->PC != current_pc) return;
+                        reverse_elements(cpu, addr, 0, len - 1, w_b, current_pc);
+                    } else { // BRTR
+                        reverse_elements(cpu, addr, 0, len - 1, w_b, current_pc);
+                        if (cpu->PC != current_pc) return;
+                        reverse_elements(cpu, addr, 0, rot - 1, w_b, current_pc);
+                        if (cpu->PC != current_pc) return;
+                        reverse_elements(cpu, addr, rot, len - 1, w_b, current_pc);
+                    }
+                }
+            }
+        }
+        else if (op == 98) { // CAS
+            uint8_t w_b = (instr >> 52) & 0x3;
+            uint8_t a = (instr >> 44) & 0xFF;
+            uint8_t b = (instr >> 36) & 0xFF;
+            uint8_t c = (instr >> 28) & 0xFF;
+            
+            uint64_t ptr = ACC(cpu, c);
+            uint64_t mem_val = mem_read(cpu, ptr, w_b, 0, 0); // Directly read memory using absolute ptr.
+            if (cpu->PC != current_pc) return;
+            
+            if (mem_val == ACC(cpu, a)) {
+                mem_write(cpu, ptr, ACC(cpu, b), w_b, 0);
+                if (cpu->PC != current_pc) return;
+                set_ovf(cpu, 1);
+            } else {
+                set_ovf(cpu, 0);
+            }
+        }
+        else if (op == 99) { // BBRT (Bit-Level Block Rotate)
+            uint8_t w_b = (instr >> 52) & 0x3;
+            uint8_t d = (instr >> 51) & 1;
+            uint8_t a_reg = (instr >> 43) & 0xFF;
+            uint8_t b_val = (instr >> 35) & 0xFF;
+            uint8_t i_flag = (instr >> 34) & 1;
+            uint8_t c_val = (instr >> 26) & 0xFF;
+            uint8_t o_flag = (instr >> 25) & 1;
+
+            uint64_t addr = ACC(cpu, a_reg);
+            uint64_t len = i_flag ? b_val : ACC(cpu, b_val);
+            uint64_t rot_bits = o_flag ? ACC(cpu, c_val) : c_val;
+            
+            uint64_t bytes = (w_b == 0) ? 8 : (w_b == 1) ? 4 : (w_b == 2) ? 2 : 1;
+            uint64_t total_bytes = len * bytes;
+
+            if (total_bytes > 0) {
+                uint64_t total_bits = total_bytes * 8;
+                rot_bits %= total_bits;
+                
+                if (rot_bits > 0) {
+                    uint64_t rot_bytes = rot_bits / 8;
+                    uint8_t rot_rem = rot_bits % 8;
+                    
+                    // Rotate the bulk bytes extremely fast
+                    if (rot_bytes > 0) {
+                        if (d == 0) { // BBRTL
+                            reverse_elements(cpu, addr, 0, rot_bytes - 1, 3, current_pc);
+                            if (cpu->PC != current_pc) return;
+                            reverse_elements(cpu, addr, rot_bytes, total_bytes - 1, 3, current_pc);
+                            if (cpu->PC != current_pc) return;
+                            reverse_elements(cpu, addr, 0, total_bytes - 1, 3, current_pc);
+                        } else { // BBRTR
+                            reverse_elements(cpu, addr, 0, total_bytes - 1, 3, current_pc);
+                            if (cpu->PC != current_pc) return;
+                            reverse_elements(cpu, addr, 0, rot_bytes - 1, 3, current_pc);
+                            if (cpu->PC != current_pc) return;
+                            reverse_elements(cpu, addr, rot_bytes, total_bytes - 1, 3, current_pc);
+                        }
+                        if (cpu->PC != current_pc) return;
+                    }
+                    
+                    // 1-pass sub-byte bit shifting
+                    if (rot_rem > 0) {
+                        if (d == 0) { // BBRTL (Leftwards over memory array)
+                            uint8_t last_val = mem_read(cpu, addr + total_bytes - 1, 3, 0, 0);
+                            if (cpu->PC != current_pc) return;
+                            uint8_t carry = last_val >> (8 - rot_rem);
+                            
+                            for (uint64_t i = 0; i < total_bytes; i++) {
+                                uint8_t val = mem_read(cpu, addr + i, 3, 0, 0);
+                                if (cpu->PC != current_pc) return;
+                                uint8_t next_carry = val >> (8 - rot_rem);
+                                uint8_t new_val = (val << rot_rem) | carry;
+                                mem_write(cpu, addr + i, new_val, 3, 0);
+                                if (cpu->PC != current_pc) return;
+                                carry = next_carry;
+                            }
+                        } else { // BBRTR (Rightwards over memory array)
+                            uint8_t first_val = mem_read(cpu, addr, 3, 0, 0);
+                            if (cpu->PC != current_pc) return;
+                            uint8_t carry = (first_val & ((1 << rot_rem) - 1)) << (8 - rot_rem);
+                            
+                            for (int64_t i = total_bytes - 1; i >= 0; i--) {
+                                uint8_t val = mem_read(cpu, addr + i, 3, 0, 0);
+                                if (cpu->PC != current_pc) return;
+                                uint8_t next_carry = (val & ((1 << rot_rem) - 1)) << (8 - rot_rem);
+                                uint8_t new_val = (val >> rot_rem) | carry;
+                                mem_write(cpu, addr + i, new_val, 3, 0);
+                                if (cpu->PC != current_pc) return;
+                                carry = next_carry;
+                            }
+                        }
+                    }
+                }
             }
         }
         else {
@@ -1320,11 +1549,11 @@ void step(XDP64 *cpu) {
 
                 case 60: case 61: case 62: case 63: { // FLOAT MATH
                     double res = 0, d_reg = get_float(ACC(cpu, a), w), d_mem = get_float(val, w);
-                    if (op == 60) res = d_reg + d_mem;
+                    if (op == 60) res = d_reg + d_mem; 
                     else if (op == 61) res = d_reg - d_mem;
                     else if (op == 62) res = d_reg * d_mem;
                     else if (op == 63) { if (d_mem == 0.0) { trigger_exception(cpu, 0); break; } res = d_reg / d_mem; }
-
+                    
                     if (isnan(res) || isinf(res)) { trigger_exception(cpu, 0); break; }
                     mem_write(cpu, ea, pack_float(res, w), w, i);
                 } break;
@@ -1501,7 +1730,7 @@ void scp(XDP64 *cpu) {
         if (!_stricmp(t, "LOAD") || !_stricmp(t, "L")) { char *p = strtok(NULL, " \n\t"); if(p) load_file(cpu, p); }
         if (!_stricmp(t, "EXAMINE") || !_stricmp(t, "E")) {
             char *p = strtok(NULL, " \n\t");
-            if (!p) printf("PC: %010llX  ST: %05llX  BASE: %010llX  TTB: %010llX  ETB: %010llX  CRB: %d\n", get_pc(cpu), (cpu->PC >> 44) & 0xFFFFF, cpu->BASE, cpu->TTB, cpu->ETB, cpu->CRB);
+            if (!p) printf("PC: %010llX  ST: %05llX  BASE: %010llX  TTB: %010llX  ETB: %010llX  CRB: %d\n", get_pc(cpu), (cpu->PC >> 40) & 0xFFFFFF, cpu->BASE, cpu->TTB, cpu->ETB, cpu->CRB);
             else if (p[0] == 'A') { int i = atoi(p+1); printf("A%d [Block %d]: %016llX\n", i, cpu->CRB, ACC(cpu, i)); }
             else printf("%010llX: %016llX\n", strtoull(p, NULL, 0), mem_read_phys(cpu, strtoull(p, NULL, 0), 0));
         }
