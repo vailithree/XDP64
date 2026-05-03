@@ -81,8 +81,8 @@ class XDP64Assembler:
         self.special_ops = [
             'PRINTS', 'INPUT', 'PRINTI', 'TSTAT', 'ITOA', 'ATOI', 'FTOA', 'ATOF', 'FTOS',
             'TWRITE', 'TREAD', 'LFS', 'LSA', 'TRAP', 'TRET', 'LDI', 'LSP', 'ADI',
-            'ERET', 'EFLSH', 'ESTCK', 'READ', 'WRITE', 'ENMMU', 'DMMU', 'SPSP',
-            'VBASE', 'VMODE', 'VFLIP', 'VSTAT'
+            'ERET', 'EFLSH', 'ESTCK', 'READ', 'WRITE', 'ENMMU', 'DMMU', 'INVPG', 'SPSP',
+            'VBASE', 'VMODE', 'VFLIP', 'VSTAT', 'WAIT', 'BRTL', 'BRTR', 'CAS', 'BBRTL', 'BBRTR'
         ] + list(self.op3_ops.keys()) + list(self.simd_ops.keys())
 
         self.res_ops = ['RESW', 'RESH', 'RESF', 'RESB']
@@ -143,10 +143,10 @@ class XDP64Assembler:
         match = re.search(r'\((.*?)\)', mem_str)
         if match:
             inner = match.group(1).strip()
-            if inner.startswith('+'):
-                mode, index = 1, self.parse_reg(inner[1:])
-            elif inner.endswith('-'):
-                mode, index = 2, self.parse_reg(inner[:-1])
+            if inner.endswith('+'):
+                mode, index = 1, self.parse_reg(inner[:-1])
+            elif inner.startswith('-'):
+                mode, index = 2, self.parse_reg(inner[1:])
             else:
                 index = self.parse_reg(inner)
             mem_str = re.sub(r'\(.*?\)', '', mem_str).strip()
@@ -618,8 +618,8 @@ class XDP64Assembler:
                     binary_output.extend(struct.pack('<Q', instr))
                     if verbose: print(f"  {addr:04X}: {mnemonic} -> {instr:016X}")
 
-                elif m_base in ['ENMMU', 'DMMU']:
-                    op = 0 if m_base == 'ENMMU' else 1
+                elif m_base in ['ENMMU', 'DMMU', 'INVPG']:
+                    op = 0 if m_base == 'ENMMU' else 1 if m_base == 'DMMU' else 2
                     dev = 0x01
                     instr = header | (dev << 50) | (op << 42)
                     binary_output.extend(struct.pack('<Q', instr))
@@ -722,13 +722,14 @@ class XDP64Assembler:
                     if verbose: print(f"  {addr:04X}: {mnemonic} -> {instr:016X}")
 
                 elif m_base == 'PRINTI':
-                    term_str = arg_list[0] if arg_list and arg_list[0] else "0"
+                    term_str = arg_list[0].strip() if arg_list and arg_list[0] else "0"
                     i_sel = 0
 
                     if term_str.upper().startswith('A'):
                         i_sel = 1
                         term = self.parse_reg(term_str)
                     else:
+                        if term_str.startswith('#'): term_str = term_str[1:]
                         try:
                             term = int(term_str, 0) & 0xF
                         except ValueError:
@@ -753,13 +754,14 @@ class XDP64Assembler:
                     if verbose: print(f"  {addr:04X}: {mnemonic} -> {instr:016X}")
 
                 elif m_base in ['PRINTS', 'INPUT', 'TSTAT']:
-                    term_str = arg_list[0] if arg_list and arg_list[0] else "0"
+                    term_str = arg_list[0].strip() if arg_list and arg_list[0] else "0"
                     i_sel = 0
 
                     if term_str.upper().startswith('A'):
                         i_sel = 1
                         term = self.parse_reg(term_str)
                     else:
+                        if term_str.startswith('#'): term_str = term_str[1:]
                         try:
                             term = int(term_str, 0) & 0xF
                         except ValueError:
@@ -810,7 +812,15 @@ class XDP64Assembler:
                 elif m_base in ['VBASE', 'VMODE', 'VFLIP', 'VSTAT']:
                     op = {'VBASE': 0, 'VMODE': 1, 'VFLIP': 2, 'VSTAT': 3}[m_base]
                     s_str = arg_list[0].strip() if len(arg_list) > 0 else "0"
-                    s_val = int(s_str, 0) & 0xF
+
+                    if s_str.startswith('#'):
+                        s_str = s_str[1:]
+
+                    try:
+                        s_val = int(s_str, 0) & 0xF
+                    except ValueError:
+                        v = self.eval_expr(s_str, addr)
+                        s_val = (v if v is not None else self.get_label(s_str, addr)) & 0xF
 
                     a_val = 0
                     i_flag = 0
@@ -828,8 +838,72 @@ class XDP64Assembler:
                     binary_output.extend(struct.pack('<Q', instr))
                     if verbose: print(f"  {addr:04X}: {mnemonic} -> {instr:016X}")
 
+                elif m_base == 'WAIT':
+                    arg_str = arg_list[0].strip() if len(arg_list) > 0 else "0"
+                    if arg_str.upper().startswith('A'):
+                        op = 1
+                        reg = self.parse_reg(arg_str)
+                        instr = header | (0x06 << 50) | (op << 46) | (reg << 38)
+                    else:
+                        op = 0
+                        imm_str = arg_str[1:] if arg_str.startswith('#') else arg_str
+                        try:
+                            imm32 = int(imm_str, 0)
+                        except ValueError:
+                            v = self.eval_expr(imm_str, addr)
+                            imm32 = v if v is not None else self.get_label(imm_str, addr)
+                        instr = header | (0x06 << 50) | (op << 46) | (imm32 & 0xFFFFFFFF)
+                    binary_output.extend(struct.pack('<Q', instr))
+                    if verbose: print(f"  {addr:04X}: {mnemonic} -> {instr:016X}")
+
+                elif m_base in ['BRTL', 'BRTR', 'BBRTL', 'BBRTR']:
+                    is_bit = 1 if m_base.startswith('BB') else 0
+                    d_val = 0 if m_base.endswith('L') else 1
+
+                    a_str = arg_list[0].strip() if len(arg_list) > 0 else "A0"
+                    a_reg = self.parse_reg(a_str)
+
+                    b_str = arg_list[1].strip() if len(arg_list) > 1 else "A0"
+                    i_flag = 1 if b_str.startswith('#') else 0
+                    if i_flag:
+                        v = self.eval_expr(b_str[1:], addr)
+                        b_val = (v if v is not None else int(b_str[1:], 0)) & 0xFF
+                    else:
+                        b_val = self.parse_reg(b_str)
+
+                    c_str = arg_list[2].strip() if len(arg_list) > 2 else "A0"
+                    o_flag = 0 if c_str.startswith('#') else 1
+                    if o_flag == 0:
+                        v = self.eval_expr(c_str[1:], addr)
+                        c_val = (v if v is not None else int(c_str[1:], 0)) & 0xFF
+                    else:
+                        c_val = self.parse_reg(c_str)
+
+                    op = 99 if is_bit else 97
+                    instr = (op << 54) | ((width & 3) << 52) | (d_val << 51) | ((a_reg & 0xFF) << 43) | ((b_val & 0xFF) << 35) | (i_flag << 34) | ((c_val & 0xFF) << 26) | (o_flag << 25)
+                    binary_output.extend(struct.pack('<Q', instr))
+                    if verbose: print(f"  {addr:04X}: {mnemonic} -> {instr:016X}")
+
+                elif m_base == 'CAS':
+                    a_reg = self.parse_reg(arg_list[0]) if len(arg_list) > 0 else 0
+                    b_reg = self.parse_reg(arg_list[1]) if len(arg_list) > 1 else 0
+                    c_reg = self.parse_reg(arg_list[2]) if len(arg_list) > 2 else 0
+
+                    instr = (98 << 54) | ((width & 3) << 52) | ((a_reg & 0xFF) << 44) | ((b_reg & 0xFF) << 36) | ((c_reg & 0xFF) << 28)
+                    binary_output.extend(struct.pack('<Q', instr))
+                    if verbose: print(f"  {addr:04X}: {mnemonic} -> {instr:016X}")
+
                 elif m_base in ['TREAD', 'TWRITE']:
-                    tape = int(arg_list[0], 0) & 0x7 if len(arg_list) > 0 else 0
+                    t_str = arg_list[0].strip() if len(arg_list) > 0 else "0"
+                    if t_str.startswith('#'):
+                        t_str = t_str[1:]
+
+                    try:
+                        tape = int(t_str, 0) & 0x7
+                    except ValueError:
+                        v = self.eval_expr(t_str, addr)
+                        tape = (v if v is not None else self.get_label(t_str, addr)) & 0x7
+
                     acc_str = arg_list[1].strip() if len(arg_list) > 1 else "A0"
                     ind = 0
 
