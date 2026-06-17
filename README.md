@@ -1,3 +1,5 @@
+# BEWARE!!!!!!!!!!!!!!!!: THIS PROJECT IS *DEAD*! THERE IS __NOTHING__ HERE THAT YOU SHOULD SACRIFICE YOUR COMPUTER FOR!
+
 # XDP64
 
 A pretty simple computer based on the PDP10 with a 64 bit word.
